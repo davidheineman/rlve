@@ -1,0 +1,69 @@
+# Single-GPU smoke run: 50 steps of RLVE on one environment.
+# Sized for roughly an hour on one H100; verifies plumbing, not learning.
+# Consumed by tools/yaml_to_args.py, launched by scripts/slurm/1gpu.sbatch.
+
+actor-num-nodes: 1
+actor-num-gpus-per-node: 1
+num-gpus-per-node: 1
+colocate: true
+
+hf-checkpoint: ../DeepSeek-R1-Distill-Qwen-1.5B
+ref-load: ../DeepSeek-R1-Distill-Qwen-1.5B_torch_dist
+load: "../[DeepSeek-R1-Distill-Qwen-1.5B]_[1gpu-smoke]/"
+save: "../[DeepSeek-R1-Distill-Qwen-1.5B]_[1gpu-smoke]/"
+save-interval: 20
+
+disable-rollout-global-dataset: true
+rlve: true
+environment-list: [Multiplication]
+initial-difficulty: 3
+custom-prompt-preprocessor: ChatTemplate_NoSystemPrompt
+apply-chat-template: true
+rm-type: rlve
+reward-key: reward
+
+num-rollout: 50
+num-steps-per-rollout: 1
+rollout-batch-size: 4
+n-samples-per-prompt: 8
+over-sampling-batch-size: 8
+rollout-max-response-len: 3072
+rollout-temperature: 1.0
+# No dynamic-sampling-filter-path: the generation loop retries without a cap,
+# so a filter that rejects every group makes a step run forever.
+partial-rollout: true
+balance-data: true
+wandb-always-use-train-step: true
+
+tensor-model-parallel-size: 1
+pipeline-model-parallel-size: 1
+context-parallel-size: 1
+expert-model-parallel-size: 1
+expert-tensor-parallel-size: 1
+recompute-granularity: full
+recompute-method: uniform
+recompute-num-layers: 1
+use-dynamic-batch-size: true
+# Turn this down first if you OOM, then sglang-mem-fraction-static.
+max-tokens-per-gpu: 2048
+
+advantage-estimator: grpo
+entropy-coef: 0.0
+eps-clip: 0.2
+eps-clip-high: 0.28
+use-tis: true
+optimizer: adam
+lr: 2.0e-6
+lr-decay-style: constant
+weight-decay: 0.01
+adam-beta1: 0.9
+adam-beta2: 0.98
+
+rollout-num-gpus-per-engine: 1
+sglang-mem-fraction-static: 0.5
+sglang-server-concurrency: 64
+attention-dropout: 0.0
+hidden-dropout: 0.0
+accumulate-allreduce-grads-in-fp32: true
+attention-softmax-in-fp32: true
+attention-backend: flash
