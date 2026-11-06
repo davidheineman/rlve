@@ -1,0 +1,108 @@
+# One 50-step RLVE run on a single GPU. Eight of these fill an 8-GPU node; see
+# scripts/slurm/8way-50step.sbatch. Budget is ~30 min wall clock on an A6000/L40S/A100:
+# ~4 min of startup (sglang + megatron init), ~25 s/step, ~45 s per in-loop eval.
+#
+# Checkpoint paths, the environment list, the eval sets and the wandb names are passed on
+# the command line by the launcher; flags repeated there win over anything set here.
+# Consumed by tools/yaml_to_args.py.
+
+actor-num-nodes: 1
+actor-num-gpus-per-node: 1
+num-gpus-per-node: 1
+colocate: true                  # sglang and megatron share the GPU (implies --offload)
+
+# --- data source: RLVE environments, not a static dataset --------------------------
+disable-rollout-global-dataset: true
+rlve: true
+initial-difficulty: 0           # start easy; RLVE ramps difficulty up whenever rolling
+                                # accuracy passes --min-metric-to-increase-difficulty (0.9),
+                                # which is the curriculum you want to see move in 50 steps
+custom-prompt-preprocessor: ChatTemplate_BoxedAnswer   # appends "...answer inside \boxed{}"
+apply-chat-template: true
+rm-type: rlve
+reward-key: reward              # continuous env reward; use `accuracy` for a binary one
+
+# --- rollout / schedule ------------------------------------------------------------
+num-rollout: 50                 # 50 training steps, since num-steps-per-rollout is 1
+num-steps-per-rollout: 1
+rollout-batch-size: 4           # prompts per step
+n-samples-per-prompt: 8         # GRPO group size -> 32 sequences per step
+over-sampling-batch-size: 8
+rollout-max-response-len: 1024  # the single biggest knob on step time
+rollout-temperature: 1.0
+# No dynamic-sampling-filter-path: the generation loop retries without a cap, so a filter
+# that rejects every group makes a step run forever.
+partial-rollout: true
+balance-data: true
+
+# --- in-loop eval ------------------------------------------------------------------
+# Runs before step 1 and then every 10 steps, over the two datasets passed as
+# --eval-prompt-data: `val_envs` (in-domain - the environment this run trains on) and
+# `test_envs` (a spread of held-out environments). Logged as eval/<name> plus
+# david/eval/<name>/pass@k.
+#
+# 16 samples per prompt is what makes pass@1..16 meaningful and takes the noise out of
+# pass@1; at 1-2 samples the curve is mostly sampling jitter. It costs 16x the generations
+# of a single-sample eval, which is the bulk of the eval time budget.
+eval-interval: 10
+n-samples-per-eval-prompt: 16
+eval-input-key: user_prompt
+eval-reward-key: accuracy       # log pass rate, not the shaped reward
+eval-max-response-len: 1024
+eval-temperature: 0.7
+eval-top-p: 0.95
+
+# --- parallelism / memory ----------------------------------------------------------
+tensor-model-parallel-size: 1
+pipeline-model-parallel-size: 1
+context-parallel-size: 1
+expert-model-parallel-size: 1
+expert-tensor-parallel-size: 1
+recompute-granularity: full
+recompute-method: uniform
+recompute-num-layers: 1
+# Adam's fp32 master weights and moments are ~18 GB for a 1.5B model. Keeping them on the
+# GPU leaves megatron resident at ~32 GB of a 48 GB card, and sglang then fails to map its
+# pool back in after a training step ("[torch_memory_saver] CUresult error: 2"). Offloading
+# them to host memory drops megatron to ~14 GB and costs a couple of seconds per step.
+optimizer-cpu-offload: true
+overlap-cpu-optimizer-d2h-h2d: true
+use-precision-aware-optimizer: true   # megatron requires this alongside the cpu offload
+use-dynamic-batch-size: true
+# Turn this down first if you OOM, then sglang-mem-fraction-static.
+max-tokens-per-gpu: 2048
+
+# --- algorithm ---------------------------------------------------------------------
+advantage-estimator: grpo
+entropy-coef: 0.0
+eps-clip: 0.2
+eps-clip-high: 0.28
+use-tis: true
+optimizer: adam
+lr: 2.0e-6
+lr-decay-style: constant
+weight-decay: 0.01
+adam-beta1: 0.9
+adam-beta2: 0.98
+
+# --- sglang / misc -----------------------------------------------------------------
+rollout-num-gpus-per-engine: 1
+# Megatron needs ~30 GB for a 1.5B model with Adam, and in colocate mode sglang's pool has
+# to fit alongside it on the same card. At 0.55 on a 48 GB card sglang grabs a 22 GB KV
+# cache (~850k tokens, ~20x what a 32-sequence rollout uses) and training OOMs outright;
+# at 0.25 it still OOMs on the environments with long prompts, where megatron's activations
+# are largest. 0.15 is ~5 GB of KV, ~190k tokens - still 4x more than a step needs - and
+# leaves the pair comfortably inside 48 GB (also fits a 40 GB A100).
+sglang-mem-fraction-static: 0.15
+sglang-server-concurrency: 64
+attention-dropout: 0.0
+hidden-dropout: 0.0
+accumulate-allreduce-grads-in-fp32: true
+attention-softmax-in-fp32: true
+attention-backend: flash
+
+# --- logging -----------------------------------------------------------------------
+use-wandb: true
+wandb-always-use-train-step: true
+disable-wandb-random-suffix: true
+log-passrate: true

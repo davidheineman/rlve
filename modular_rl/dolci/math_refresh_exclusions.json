@@ -1,0 +1,127 @@
+[
+  {
+    "problem": "Find the largest possible number of faces of a convex polyhedron in \\mathbb{R}^3 such that all its vertices have integer coordinates and there are no other integer points on its surface or inside it.",
+    "id": "ultra_dsv4_cot_aops_rs0_000000011",
+    "source": "nemotron",
+    "origin": "AoPS",
+    "rejection_reason": "Verified wrong reference: the convex hull of two unimodular parallelograms in integer layers z=0,1 has ten facets and no lattice points except its eight vertices.",
+    "counterexample_vertices": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ],
+      [
+        1,
+        1,
+        1
+      ],
+      [
+        3,
+        4,
+        1
+      ],
+      [
+        2,
+        3,
+        1
+      ]
+    ],
+    "counterexample_facet_planes": [
+      [
+        0,
+        0,
+        1,
+        -1
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        -3,
+        -1
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        -1,
+        0,
+        1
+      ],
+      [
+        1,
+        -1,
+        1,
+        -1
+      ],
+      [
+        1,
+        0,
+        -2,
+        -1
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        3,
+        -2,
+        -2,
+        2
+      ],
+      [
+        3,
+        -2,
+        2,
+        -3
+      ]
+    ]
+  },
+  {
+    "problem": "Find all prime numbers p such that 2p+1 , 4p+3 , 8p+7 , and 16p+15 are also prime numbers.",
+    "id": "ultra_dsv4_cot_aops_rs0_000014416",
+    "source": "nemotron",
+    "origin": "AoPS",
+    "rejection_reason": "Incorrect finite prime-chain reference. Counterexample p=53639 gives five primes 53639,107279,214559,429119,858239; p=53849 also works."
+  },
+  {
+    "problem": "Find 325_{8}-237_{8} . Express your answer in base 8 .",
+    "id": "aca87499c26bc22a103696fe2b21f95d663da525e6f8f3d24b42eccd8f195a6e",
+    "source": "openmath",
+    "origin": "math",
+    "rejection_reason": "Worked solution uses invalid borrowing steps in base 8. Correct check: 325_8=213, 237_8=159, difference54=66_8, but the selected response does not derive it correctly."
+  }
+]

@@ -17,6 +17,8 @@ from Gym.parameter_controllers import identifier2controller
 from typing import List, Optional, Tuple, Dict, Any
 
 from slime.utils.data import custom_prompt_preprocessor
+from slime.utils.rlve_mixing import FrozenPromptMix
+from slime.utils.rlve_difficulty import BalancedDifficultySchedule
 
 
 class RLVEManager :
@@ -30,10 +32,24 @@ class RLVEManager :
 
         self.environment2accuracy = {environment : dict(accuracy = 0, num_samples = 0) for environment in args.environment_list}
         self.problem_generation_seed = 0
+        self.balanced_difficulty = (
+            BalancedDifficultySchedule(args.environment_list, args.initial_difficulty)
+            if getattr(args, "rlve_balanced_difficulty", False) else None
+        )
+        self.frozen_mix = None
+        if args.rlve_prompt_pool is not None:
+            self.frozen_mix = FrozenPromptMix(
+                args.rlve_prompt_pool,
+                args.environment_list,
+                args.rlve_mix_weights,
+                args.rlve_mix_seed,
+                args.rlve_pool_sha256,
+            )
 
 
     def generate_problem(self) -> Tuple[str, Optional[VerifiableEnvironment]] :
-        environment : str = random.choice(self.args.environment_list)
+        pair = self.balanced_difficulty.peek() if self.balanced_difficulty is not None else None
+        environment : str = pair[0] if pair is not None else random.choice(self.args.environment_list)
 
         parameter_controller : ParameterController = identifier2controller[environment]()
         maximum_difficulty : int = self.environment2difficulty[environment]
@@ -43,11 +59,18 @@ class RLVEManager :
                 parameter_lists.append((problem_difficulty, copy.deepcopy(parameter_controller.get_parameter_list())))
             parameter_controller.update()
 
-        problem_difficulty, parameter_list = random.choice(parameter_lists)
+        if pair is None:
+            problem_difficulty, parameter_list = random.choice(parameter_lists)
+        else:
+            problem_difficulty = pair[1]
+            parameter_list = next(parameters for level, parameters in parameter_lists
+                                  if level == problem_difficulty)
         parameter : Dict = random.choice(parameter_list)
         problem : VerifiableEnvironment = identifier2environment[environment]()
         if problem.generator(seed = self.problem_generation_seed, parameter = parameter) :
             generated_problem = problem
+            if self.balanced_difficulty is not None:
+                self.balanced_difficulty.accept()
         else :
             generated_problem = None
             print("Generating problem for environment {} failed\nparameter: {}\n\n\n".format(environment, parameter), flush=True)
@@ -56,11 +79,16 @@ class RLVEManager :
         return environment, problem_difficulty, generated_problem
 
     def get_sample(self) -> Optional[Sample] :
-        environment, problem_difficulty, problem = self.generate_problem()
-        if problem is None :
-            return None
-
-        user_prompt = problem.prompt_generator()
+        if self.frozen_mix is None:
+            environment, problem_difficulty, problem = self.generate_problem()
+            if problem is None:
+                return None
+            user_prompt = problem.prompt_generator()
+            config = problem.get_config()
+        else:
+            environment, user_prompt, config = self.frozen_mix.draw()
+            problem_difficulty = 0
+            self.problem_generation_seed += 1
         prompt = custom_prompt_preprocessor(args = self.args, user_prompt = user_prompt, apply_chat_template = self.args.apply_chat_template)
 
         apply_chat_template = self.args.apply_chat_template
@@ -83,7 +111,7 @@ class RLVEManager :
         return Sample(
             prompt = prompt,
             label = None,
-            metadata = dict(environment = environment, problem_difficulty = problem_difficulty, config = problem.get_config()),
+            metadata = dict(environment = environment, problem_difficulty = problem_difficulty, config = config),
         )
 
     def get_state(self) -> Dict[str, Any] :
@@ -91,12 +119,21 @@ class RLVEManager :
             environment2difficulty = self.environment2difficulty,
             environment2accuracy = self.environment2accuracy,
             problem_generation_seed = self.problem_generation_seed,
+            frozen_mix_state = self.frozen_mix.get_state() if self.frozen_mix is not None else None,
+            balanced_difficulty_state = self.balanced_difficulty.get_state() if self.balanced_difficulty is not None else None,
         )
 
     def set_state(self, state : Dict[str, Any]) -> None :
         self.environment2difficulty = state["environment2difficulty"]
         self.environment2accuracy = state["environment2accuracy"]
         self.problem_generation_seed = state["problem_generation_seed"]
+        if self.frozen_mix is not None:
+            self.frozen_mix.set_state(state["frozen_mix_state"])
+        if self.balanced_difficulty is not None:
+            self.balanced_difficulty = BalancedDifficultySchedule(
+                self.args.environment_list, self.args.initial_difficulty,
+                state["balanced_difficulty_state"],
+            )
 
     def update(self, samples : List[Sample]) -> Dict[str, Any] :
         """
@@ -117,6 +154,12 @@ class RLVEManager :
             self.environment2accuracy[environment]["accuracy"] += sample.reward["accuracy"]
 
         log_dict["rollout/problem_generation_seed"] = self.problem_generation_seed
+        if self.balanced_difficulty is not None:
+            for difficulty in range(self.args.initial_difficulty + 1):
+                log_dict[f"RLVE/difficulty_prompts/{difficulty}"] = sum(
+                    count for (_, level), count in self.balanced_difficulty.counts.items()
+                    if level == difficulty
+                )
 
         for environment in self.args.environment_list :
             num_samples, accuracy = self.environment2accuracy[environment]["num_samples"], self.environment2accuracy[environment]["accuracy"]
@@ -146,6 +189,7 @@ class RolloutDataSource:
 
         assert (args.rollout_global_dataset and not args.rlve) or (not args.rollout_global_dataset and args.rlve), "Incompatible arguments: args.rollout_global_dataset and args.rlve must be mutually exclusive, and one of them must be set."
         self.rlve_manager = None
+        self.tree_sampler = None
 
         if args.rollout_global_dataset:
             tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
@@ -154,7 +198,14 @@ class RolloutDataSource:
             if (d := args.dump_details) is not None:
                 tokenizer.save_pretrained(Path(d) / "tokenizer")
 
-            self.dataset = Dataset(
+            if args.program_tree_sampler_spec is not None:
+                from program_trees.next_experiments import ProgramTreeSampler
+
+                self.tree_sampler = ProgramTreeSampler.from_file(args.program_tree_sampler_spec)
+                self.tokenizer = tokenizer
+                self.dataset = None
+            else:
+                self.dataset = Dataset(
                 args.prompt_data,
                 tokenizer=tokenizer,
                 max_length=args.rollout_max_prompt_len,
@@ -165,8 +216,8 @@ class RolloutDataSource:
                 apply_chat_template=args.apply_chat_template,
                 seed=args.rollout_seed,
                 args=args,
-            )
-            if self.args.rollout_shuffle:
+                )
+            if self.args.rollout_shuffle and self.dataset is not None:
                 self.dataset.shuffle(self.epoch_id)
         elif args.rlve:
             self.dataset = None
@@ -180,7 +231,31 @@ class RolloutDataSource:
         samples = []
 
         # TODO unify the two branches
-        if self.dataset is not None:
+        if self.tree_sampler is not None:
+            for _ in range(num_samples):
+                row = self.tree_sampler.draw()
+                prompt = custom_prompt_preprocessor(
+                    args=self.args, user_prompt=row["user_prompt"],
+                    apply_chat_template=self.args.apply_chat_template,
+                )
+                if self.args.apply_chat_template:
+                    if self.args.tool_key is not None:
+                        raise ValueError("Program-tree sampler does not use tools")
+                    prompt = self.tokenizer.apply_chat_template(
+                        prompt, None, tokenize=False, add_generation_prompt=True,
+                    )
+                if (self.args.rollout_max_prompt_len is not None and
+                        len(self.tokenizer(prompt)["input_ids"]) > self.args.rollout_max_prompt_len):
+                    raise ValueError("Sampled program-tree prompt exceeds rollout-max-prompt-len")
+                prompt_sample = Sample(prompt=prompt, label=row["label"], metadata=row["metadata"])
+                group = []
+                for _ in range(self.args.n_samples_per_prompt):
+                    sample = copy.deepcopy(prompt_sample)
+                    sample.index = self.sample_index
+                    self.sample_index += 1
+                    group.append(sample)
+                samples.append(group)
+        elif self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
                 self.sample_offset += num_samples
@@ -253,6 +328,8 @@ class RolloutDataSource:
             "sample_index": self.sample_index,
             "metadata": self.metadata,
         }
+        if self.tree_sampler is not None:
+            state_dict["program_tree_sampler"] = self.tree_sampler.state_dict()
         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
@@ -262,13 +339,14 @@ class RolloutDataSource:
             return
         if rollout_id == -1 :
             return
+        load_options = {"weights_only": False} if getattr(self.args, "transactional_checkpoints", False) else {}
 
         if not self.args.rollout_global_dataset:
             if self.args.rlve :
                 path = os.path.join(self.args.load, f"rollout/rlve_manager_state_dict_{rollout_id}.pt")
                 if not os.path.exists(path):
                     assert False, f"Checkpoint {path} does not exist."
-                state_dict = torch.load(path)
+                state_dict = torch.load(path, **load_options)
                 self.rlve_manager.set_state(state_dict)
             else :
                 assert False, "None of args.rollout_global_dataset or args.rlve is set - there is no data source."
@@ -284,13 +362,17 @@ class RolloutDataSource:
 
         print(f"load metadata from {path}")
         print(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, **load_options)
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_index = state_dict.get("sample_index", 0)
         self.metadata = state_dict.get("metadata", {})
+        if self.tree_sampler is not None:
+            if "program_tree_sampler" not in state_dict:
+                raise ValueError("Checkpoint lacks program-tree sampler state")
+            self.tree_sampler.load_state_dict(state_dict["program_tree_sampler"])
 
-        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
+        if self.dataset is not None and self.args.rollout_global_dataset and self.args.rollout_shuffle:
             self.dataset.shuffle(self.epoch_id)
 
 

@@ -1,4 +1,5 @@
 import multiprocessing
+import os
 import random
 import time
 from typing import List
@@ -65,7 +66,10 @@ def create_rollout_engines(args, pg):
 
         def get_addr_and_ports():
             # use small ports to prevent ephemeral port between 32768 and 65536.
-            start_port = 10000
+            # SLIME_PORT_BASE gives each run its own 3000-port block, so several runs can
+            # share a node without two of them picking the same "free" port. Within a block:
+            # engines at +0, torch.distributed at +500, sglang router at +1000, prometheus at +2000.
+            start_port = int(os.environ.get("SLIME_PORT_BASE", 10000))
 
             def port(consecutive=1):
                 nonlocal start_port
@@ -123,14 +127,16 @@ def _start_router(args):
 
     from sglang_router.launch_router import RouterArgs
 
+    port_base = os.environ.get("SLIME_PORT_BASE")
+
     args.sglang_router_ip = get_host_info()[1]
-    args.sglang_router_port = find_available_port(random.randint(3000, 4000))
+    args.sglang_router_port = find_available_port(int(port_base) + 1000 if port_base else random.randint(3000, 4000))
 
     router_args = RouterArgs(
         host=args.sglang_router_ip,
         port=args.sglang_router_port,
         balance_abs_threshold=0,
-        prometheus_port=find_available_port(random.randint(4000, 5000)),
+        prometheus_port=find_available_port(int(port_base) + 2000 if port_base else random.randint(4000, 5000)),
     )
 
     if hasattr(router_args, "log_level"):

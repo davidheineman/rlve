@@ -43,6 +43,9 @@ def init_wandb_primary(args):
         group = args.wandb_group
         run_name = args.wandb_group
 
+    if args.wandb_run_name is not None:
+        run_name = args.wandb_run_name
+
     # Prepare wandb init parameters
     init_kwargs = {
         "entity": args.wandb_team,
@@ -51,12 +54,14 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": args.__dict__,
     }
+    if os.environ.get("RLVE_WANDB_RUN_ID"):
+        init_kwargs.update(id=os.environ["RLVE_WANDB_RUN_ID"], resume="allow")
 
     # Configure settings based on offline/online mode
     if offline:
-        init_kwargs["settings"] = wandb.Settings(mode="offline")
+        init_kwargs["settings"] = wandb.Settings(mode="offline", init_timeout=300)
     else:
-        init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+        init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True, init_timeout=300)
 
     # Add custom directory if specified
     if args.wandb_dir:
@@ -97,12 +102,13 @@ def init_wandb_secondary(args, wandb_run_id):
 
     # Configure settings based on offline/online mode
     if offline:
-        init_kwargs["settings"] = wandb.Settings(mode="offline")
+        init_kwargs["settings"] = wandb.Settings(mode="offline", init_timeout=300)
     else:
         init_kwargs["settings"] = wandb.Settings(
             mode="shared",
             x_primary=False,
             x_update_finish_state=False,
+            init_timeout=300,
         )
 
     # Add custom directory if specified
@@ -126,6 +132,9 @@ def _init_wandb_common():
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
     wandb.define_metric("RLVE/*", step_metric="rollout/step")
+    # Custom metric namespace: pass@k on both eval sets, plus the per-step cost of a run.
+    wandb.define_metric("david/step")
+    wandb.define_metric("david/*", step_metric="david/step")
 
 
 def get_wandb_offline_dir(args):

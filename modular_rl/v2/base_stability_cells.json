@@ -1,0 +1,6 @@
+[
+  {"model": "Qwen3-0.6B-Base", "cap": 2048, "variant": "lr1e-6", "lr": 0.000001, "responses": 8000, "passes": 1},
+  {"model": "Qwen3-0.6B-Base", "cap": 2048, "variant": "kl0p01", "lr": 0.000002, "responses": 8000, "passes": 1, "reference_kl": 0.01},
+  {"model": "Qwen3-0.6B-Base", "cap": 2048, "variant": "kl0p03", "lr": 0.000002, "responses": 8000, "passes": 1, "reference_kl": 0.03},
+  {"model": "Qwen3-0.6B-Base", "cap": 4096, "variant": "kl0p03", "lr": 0.000002, "responses": 8000, "passes": 1, "reference_kl": 0.03}
+]

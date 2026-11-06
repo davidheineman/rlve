@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import wandb
 
 from tqdm import tqdm
@@ -7,6 +8,9 @@ from transformers import AutoTokenizer
 
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
+from slime.utils.eval_metrics import group_eval_results
+from slime.utils.eval_rollouts import select_eval_rollouts
+from slime.utils.final_ood_eval import eval_path, should_run_dataset
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.types import Sample
@@ -14,6 +18,13 @@ from slime.utils.types import Sample
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout"]
+
+# Successful R1 Distill depth-1 tree traces usually close reasoning with
+# </think> and put the answer in a JSON object. Only the framing is supplied;
+# the model must still generate the value and the closing syntax.
+ANSWER_FORCING_PREFIX = '\n</think>\n\n{"output": "'
+ANSWER_FORCING_PREFIX_AFTER_THINK = '\n\n{"output": "'
+ANSWER_FORCING_KEY = "_answer_forcing"
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -65,72 +76,89 @@ class GenerateState(metaclass=SingletonMeta):
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
-
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
-
-    if len(sample.response) > 0:
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(
-            state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
-        )
-
-    assert (
-        sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
-    if sampling_params["max_new_tokens"] == 0:
+    initial_cap = sampling_params["max_new_tokens"]
+    forcing_state = sample.metadata.get(ANSWER_FORCING_KEY) if isinstance(sample.metadata, dict) else None
+    if forcing_state is not None:
+        # An aborted continuation can be resumed without inserting the prefix twice.
+        generated_after_prefix = sample.response_length - forcing_state["initial_tokens"] - forcing_state["prefix_tokens"]
+        remaining = args.answer_forcing_extra_tokens - generated_after_prefix
+    else:
+        remaining = initial_cap - sample.response_length
+    assert remaining >= 0, f"remaining generation tokens {remaining} should not be negative"
+    if remaining == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
 
-    # Token-based mode: use tokens directly
-    if len(sample.response) > 0:
-        input_token_ids = sample.tokens
+    if not sample.tokens:
+        sample.tokens = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+
+    async def generate_chunk(max_new_tokens):
+        params = sampling_params.copy()
+        params["max_new_tokens"] = max_new_tokens
+        output = await post(
+            url,
+            {"input_ids": sample.tokens.copy(), "sampling_params": params, "return_logprob": True},
+            use_http2=args.use_http2,
+        )
+        token_logprobs = output["meta_info"].get("output_token_logprobs", [])
+        new_tokens = [item[1] for item in token_logprobs]
+        sample.tokens.extend(new_tokens)
+        sample.response_length += len(new_tokens)
+        sample.response += output["text"]
+        if sample.loss_mask is not None:
+            sample.loss_mask.extend([1] * len(new_tokens))
+        if "weight_version" in output["meta_info"]:
+            sample.weight_versions.append(output["meta_info"]["weight_version"])
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = []
+        sample.rollout_log_probs.extend(item[0] for item in token_logprobs)
+        match output["meta_info"]["finish_reason"]["type"]:
+            case "length":
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
+        return sample
+
+    if forcing_state is not None:
+        return await generate_chunk(remaining)
+
+    await generate_chunk(remaining)
+    if sample.status != Sample.Status.TRUNCATED or not getattr(args, "answer_forcing", False):
+        return sample
+
+    # Frozen RLVE eval files encode metadata as JSON; live training uses dicts.
+    if isinstance(sample.metadata, str):
+        sample.metadata = json.loads(sample.metadata)
+    if getattr(args, "rlve", False):
+        marker = getattr(args, "answer_marker_type", r"\boxed{}")
+        if marker == r"\boxed{}":
+            answer_prefix = r"\boxed{"
+        elif marker == "<answer></answer>":
+            answer_prefix = "<answer>"
+        else:
+            raise ValueError(f"Unsupported RLVE answer marker: {marker}")
+        prefix = ("\n\n" if "</think>" in sample.response else "\n</think>\n\n") + answer_prefix
     else:
-        # First turn: initialize with prompt tokens
-        prompt_token_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
-        input_token_ids = prompt_token_ids
-        # Initialize sample.tokens with prompt for subsequent turns
-        if not sample.tokens:  # Only set if empty
-            sample.tokens = prompt_token_ids
-
-    # Prepare payload - shared structure
-    payload = {
-        "input_ids": input_token_ids,
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-    }
-
-    output = await post(url, payload, use_http2=args.use_http2)
-
-    # Extract new response tokens
-    if "output_token_logprobs" in output["meta_info"]:
-        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-    else:
-        # abort
-        new_response_tokens = []
-        new_response_log_probs = []
-
-    # Update sample with tokens directly - avoiding re-tokenization
-    sample.tokens = sample.tokens + new_response_tokens
-    sample.response_length += len(new_response_tokens)
-    sample.response += output["text"]
-    if "weight_version" in output["meta_info"]:
-        sample.weight_versions.append(output["meta_info"]["weight_version"])
-    if sample.rollout_log_probs is None:
-        sample.rollout_log_probs = []
-    sample.rollout_log_probs += new_response_log_probs
-
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
-
+        prefix = ANSWER_FORCING_PREFIX_AFTER_THINK if "</think>" in sample.response else ANSWER_FORCING_PREFIX
+    if not isinstance(sample.metadata, dict):
+        raise TypeError("answer forcing requires sample.metadata to be a dict")
+    prefix_tokens = state.tokenizer(prefix, add_special_tokens=False)["input_ids"]
+    initial_tokens = sample.response_length
+    if sample.loss_mask is None:
+        sample.loss_mask = [1] * initial_tokens
+    sample.tokens.extend(prefix_tokens)
+    sample.response_length += len(prefix_tokens)
+    sample.response += prefix
+    sample.loss_mask.extend([0] * len(prefix_tokens))
+    sample.rollout_log_probs.extend([0.0] * len(prefix_tokens))
+    sample.metadata[ANSWER_FORCING_KEY] = {"initial_tokens": initial_tokens, "prefix_tokens": len(prefix_tokens)}
+    await generate_chunk(args.answer_forcing_extra_tokens)
     return sample
 
 
@@ -269,16 +297,20 @@ async def generate_rollout_async(args, rollout_id: int, data_source, data_buffer
     )
 
     # target_data_size is the total number of valid samples to get
-    target_data_size = args.rollout_batch_size
+    target_data_size = getattr(args, "opd_fresh_batch_size", None) or args.rollout_batch_size
 
     data = []
     all_data = []
+    rejected_groups = 0
+    fallback_groups = 0
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            samples = data_source(min(args.over_sampling_batch_size, target_data_size)
+                                  if getattr(args, "opd_fresh_batch_size", None)
+                                  else args.over_sampling_batch_size)
             print("Fetched {} samples from the data source".format(len(samples)), flush=True)
             state.submit_generate_tasks(samples)
 
@@ -299,14 +331,31 @@ async def generate_rollout_async(args, rollout_id: int, data_source, data_buffer
 
             assert len(group) == args.n_samples_per_prompt
             if dynamic_filter is not None and not dynamic_filter(args, group):
-                state.remaining_batch_size -= 1
-                continue
+                max_rejections = args.dynamic_sampling_max_rejections
+                if max_rejections is None or rejected_groups < max_rejections:
+                    rejected_groups += 1
+                    state.remaining_batch_size -= 1
+                    continue
+                fallback_groups += 1
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+
+    if dynamic_filter is not None:
+        print(
+            f"Dynamic sampling rollout {rollout_id}: rejected={rejected_groups}, "
+            f"fallback_accepted={fallback_groups}", flush=True
+        )
+        if args.use_wandb:
+            wandb.log({
+                "rollout/step": rollout_id if not args.wandb_always_use_train_step else
+                    rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size,
+                "david/dynamic_sampling/rejected_groups": rejected_groups,
+                "david/dynamic_sampling/fallback_groups": fallback_groups,
+            })
 
     if args.rlve :
         assert args.rm_type == "rlve", f"Expected rm_type to be 'rlve', got {args.rm_type}"
@@ -345,7 +394,7 @@ async def generate_rollout_async(args, rollout_id: int, data_source, data_buffer
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
-    assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
+    assert len(data) == target_data_size, f"Got {len(data)} samples, expected {target_data_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
@@ -361,6 +410,12 @@ async def eval_rollout(args, rollout_id):
     results = {}
     for i in range(0, len(args.eval_prompt_data), 2):
         name, path = args.eval_prompt_data[i : i + 2]
+        if not should_run_dataset(name, rollout_id, args.num_rollout, args.eval_interval,
+                                  getattr(args, "rlve_final_ood_eval_path", None),
+                                  getattr(args, "rlve_final_ood_only", False)):
+            continue
+        path = eval_path(name, path, rollout_id, args.num_rollout,
+                         getattr(args, "rlve_final_ood_eval_path", None))
         results.update(await eval_rollout_single_dataset(args, rollout_id, name, path))
     return results, []
 
@@ -378,9 +433,10 @@ async def eval_rollout_single_dataset(args, rollout_id, name, path):
 
     global EVAL_PROMPT_DATASET
 
-    if name not in EVAL_PROMPT_DATASET:
+    cache_key = (name, path)
+    if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        EVAL_PROMPT_DATASET[name] = Dataset(
+        EVAL_PROMPT_DATASET[cache_key] = Dataset(
             path,
             tokenizer=tokenizer,
             max_length=args.rollout_max_prompt_len,
@@ -391,7 +447,7 @@ async def eval_rollout_single_dataset(args, rollout_id, name, path):
             apply_chat_template=args.apply_chat_template,
             args=args,
         )
-    dataset = EVAL_PROMPT_DATASET[name]
+    dataset = EVAL_PROMPT_DATASET[cache_key]
 
     sampling_params = dict(
         temperature=args.rollout_temperature if args.eval_temperature is None else args.eval_temperature,
@@ -442,13 +498,16 @@ async def eval_rollout_single_dataset(args, rollout_id, name, path):
 
     data.sort(key=lambda sample: sample.index)
 
-    reward_key = args.reward_key or args.eval_reward_key
-    return {
-        name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
-            "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
-        }
-    }
+    reward_key = args.eval_reward_key or args.reward_key
+    results = group_eval_results(
+        name,
+        rewards=[sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+        truncated=[sample.status == Sample.Status.TRUNCATED for sample in data],
+        metadata=[sample.metadata for sample in data],
+    )
+    if getattr(args, "log_eval_rollouts", False):
+        results[name]["rollout_examples"] = select_eval_rollouts(data, args.n_samples_per_eval_prompt, reward_key)
+    return results
 
 
 # TODO remove this temp function

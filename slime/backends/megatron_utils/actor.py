@@ -18,7 +18,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.timer import Timer, timer
 from slime.utils.wandb_utils import init_wandb_secondary
 
-from ..utils.data import get_data_iterator, process_rollout_data
+from ..utils.data import get_data_iterator, process_rollout_data, repeat_training_rollout
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp
 from .data import log_perf_data, log_rollout_data
@@ -54,6 +54,16 @@ class MegatronTrainRayActor(TrainRayActor):
         start_rollout_id = loaded_rollout_id + 1
         self.weights = {"actor": {}}
         self.update_cpu_params_dict(self.weights["actor"])
+
+        if self.args.fixed_rollout_policy:
+            # This copy stays unchanged as the actor snapshot is refreshed after each update.
+            if args.load == args.ref_load:
+                self.weights["fixed_rollout_policy"] = {
+                    name: tensor.clone().pin_memory() for name, tensor in self.weights["actor"].items()
+                }
+            else:
+                self.load_other_checkpoint("fixed_rollout_policy", args.ref_load)
+                self.update_gpu_params_dict(self.weights["actor"])
 
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
@@ -193,6 +203,25 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["rollout_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
                 )
             ]
+        if "teacher_log_probs" in rollout_data:
+            rollout_data["teacher_log_probs"] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(log_prob, total_length, response_length),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.float32,
+                )
+                for log_prob, total_length, response_length in zip(
+                    rollout_data["teacher_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
+                )
+            ]
+        if "opd_replay_mask" in rollout_data:
+            rollout_data["opd_replay_mask"] = [
+                torch.tensor(slice_log_prob_with_cp(mask, total_length, response_length),
+                             device=torch.cuda.current_device(), dtype=torch.float32)
+                for mask, total_length, response_length in zip(
+                    rollout_data["opd_replay_mask"], rollout_data["total_lengths"], rollout_data["response_lengths"]
+                )
+            ]
         return rollout_data
 
     def compute_log_prob(
@@ -223,6 +252,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # For debug rollout, we just log the data and return.
             rollout_data = self._get_rollout_data(rollout_data_ref)
             log_rollout_data(rollout_id, self.args, rollout_data)
+
             log_perf_data(rollout_id, self.args)
             Timer().start("train_wait")
             return
@@ -260,11 +290,20 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
+            elif self.args.loss_type == "dpo_loss":
+                rollout_data.update(
+                    self.compute_log_prob("ref", data_iterator, num_microbatches, store_prefix="ref_")
+                )
+                self.update_gpu_params_dict(self.weights["actor"])
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
             log_rollout_data(rollout_id, self.args, rollout_data)
+
+            if self.args.train_reuse_epochs > 1:
+                repeat_training_rollout(rollout_data, self.args.train_reuse_epochs)
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
             if self.args.use_pytorch_profiler and torch.distributed.get_rank() == 0 and self.prof is not None:
                 self.prof.step()
@@ -330,19 +369,22 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @timer
-    def update_weights(self):
+    def update_weights(self, model_tag="actor"):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+
+        if model_tag not in self.weights:
+            raise ValueError(f"No weights available for model tag {model_tag!r}")
 
         if self.args.offload and hasattr(mpu, "reload_process_groups"):
             mpu.reload_process_groups()
 
         with torch_memory_saver.disable() if self.args.offload and not torch.version.hip else nullcontext():
             print_memory("before update_weights")
-            self.weight_updator.update_weights()
+            self.weight_updator.update_weights(model_tag=model_tag)
             print_memory("after update_weights")
 
-            if getattr(self.args, "keep_old_actor", False):
+            if model_tag == "actor" and getattr(self.args, "keep_old_actor", False):
                 print("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
                 # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
                 # First copy rollout_actor to old_actor

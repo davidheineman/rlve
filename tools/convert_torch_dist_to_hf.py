@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import os
 import pickle
@@ -12,9 +13,6 @@ import torch
 import torch.distributed.checkpoint as dist_cp
 from transformers import AutoConfig
 from typing_extensions import override
-
-from slime.backends.megatron_utils.update_weight_utils import convert_to_hf, remove_padding
-
 
 class UnpicklerWrapper(pickle.Unpickler):
     @override
@@ -103,6 +101,20 @@ def get_named_params(args, state_dict):
         yield from get_layer_param(args, name, param)
 
 
+def model_converter(model_name):
+    if "qwen2" in model_name or ("qwen3" in model_name and "qwen3moe" not in model_name):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "slime", "backends", "megatron_utils", "megatron_to_hf", "qwen2.py"
+        )
+        spec = importlib.util.spec_from_file_location("qwen2_converter", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return lambda args, name, param: module.convert_qwen2_to_hf(args, name, param)
+    from slime.backends.megatron_utils.update_weight_utils import convert_to_hf
+
+    return lambda args, name, param: convert_to_hf(args, model_name, name, param)
+
+
 def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_size=None):
     # for slime update_weight compatible
     setattr(args, "sglang_enable_ep_moe", False)
@@ -113,10 +125,14 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
     current_size = 0
     total_size = 0
     modeltensors = [{}]
+    convert_param = model_converter(model_name)
     for name, param in get_named_params(args, state_dict):
-        if vocab_size:
-            param = remove_padding(name, param, vocab_size)
-        converted_named_tensors = convert_to_hf(args, model_name, name, param)
+        if vocab_size and name in {
+            "module.module.embedding.word_embeddings.weight",
+            "module.module.output_layer.weight",
+        }:
+            param = param[:vocab_size]
+        converted_named_tensors = convert_param(args, name, param)
         for converted_name, converted_param in converted_named_tensors:
             tensor_size = converted_param.numel() * converted_param.element_size()
             if tensor_size + current_size > chunk_size:

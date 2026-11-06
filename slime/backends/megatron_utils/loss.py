@@ -5,6 +5,7 @@ from megatron.core import mpu
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.dpo import pair_loss
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -340,6 +341,35 @@ def sft_loss_function(args, batch, logits, sum_of_sample_mean):
     )
 
 
+def dpo_loss_function(args, batch, logits, sum_of_sample_mean):
+    """Score whole chosen/rejected responses against a fixed starting policy."""
+    del sum_of_sample_mean
+    lengths = batch["response_lengths"]
+    references = batch["ref_log_probs"]
+    masks = batch["loss_masks"]
+    if len(lengths) != 2 or references is None or len(references) != 2:
+        raise ValueError("DPO requires one chosen/rejected pair per microbatch")
+    log_probs = get_log_probs_and_entropy(
+        logits, args=args, unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"], response_lengths=lengths,
+        with_entropy=False,
+    )["log_probs"]
+    policy_scores = []
+    reference_scores = []
+    for policy, reference, mask in zip(log_probs, references, masks):
+        if policy.shape != reference.shape or policy.shape != mask.shape or not mask.any():
+            raise ValueError("DPO policy, reference, and response mask must align")
+        policy_scores.append((policy * mask).sum())
+        reference_scores.append((reference * mask).sum())
+    losses, margins = pair_loss(policy_scores, reference_scores, beta=args.dpo_beta)
+    # The surrounding Megatron loss scaler divides by the number of samples.
+    loss = 2 * losses.sum()
+    return loss, {
+        "loss": loss.detach(),
+        "dpo_margin": (2 * margins.sum()).detach(),
+        "dpo_preference_accuracy": (2 * (margins > 0).float().sum()).detach(),
+    }
+
 def loss_function(args, batch, num_microbatches, logits):
     num_tokens = sum(batch["response_lengths"])
     num_samples = len(batch["response_lengths"])
@@ -363,6 +393,8 @@ def loss_function(args, batch, num_microbatches, logits):
             loss, log = policy_loss_function(**loss_function_kwargs)
         case "sft_loss":
             loss, log = sft_loss_function(**loss_function_kwargs)
+        case "dpo_loss":
+            loss, log = dpo_loss_function(**loss_function_kwargs)
         case "custom_loss":
             custom_loss_function = load_function(args.custom_loss_function_path)
             loss, log = custom_loss_function(**loss_function_kwargs)

@@ -141,13 +141,21 @@ class RayTrainGroup:
         """Do one rollout training"""
         return [actor.train.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]
 
-    def async_save_model(self, step_id):
-        """Save actor model on rank 0."""
-        return [actor.save_model.remote(step_id) for actor in self._actor_handlers]
+    def async_set_rollouts_per_prompt(self, count):
+        return [actor.set_rollouts_per_prompt.remote(count) for actor in self._actor_handlers]
 
-    def async_update_weights(self):
+    def async_save_model(self, step_id, with_optimizer=True):
+        """Save actor model on rank 0."""
+        return [actor.save_model.remote(step_id, with_optimizer=with_optimizer) for actor in self._actor_handlers]
+
+    def async_update_weights(self, model_tag="actor"):
         """Broadcast weights from rank 0 to all other ranks."""
-        return [actor.update_weights.remote() for actor in self._actor_handlers]
+        if model_tag == "actor":
+            return [actor.update_weights.remote() for actor in self._actor_handlers]
+        return [actor.update_weights.remote(model_tag=model_tag) for actor in self._actor_handlers]
 
     def async_offload(self):
         return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
+
+    def async_onload(self):
+        return [actor.wake_up.remote(("model",)) for actor in self._actor_handlers]

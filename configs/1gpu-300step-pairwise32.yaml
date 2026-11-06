@@ -1,0 +1,73 @@
+actor-num-nodes: 1
+actor-num-gpus-per-node: 1
+num-gpus-per-node: 1
+colocate: true
+
+disable-rollout-global-dataset: true
+rlve: true
+initial-difficulty: 0
+min-metric-to-increase-difficulty: 1.1
+custom-prompt-preprocessor: ChatTemplate_BoxedAnswer
+apply-chat-template: true
+rm-type: rlve
+reward-key: reward
+
+num-rollout: 300
+num-steps-per-rollout: 1
+rollout-batch-size: 4
+n-samples-per-prompt: 8
+over-sampling-batch-size: 8
+rollout-max-response-len: 1024
+rollout-temperature: 1.0
+partial-rollout: true
+balance-data: true
+
+eval-interval: 10
+n-samples-per-eval-prompt: 8
+eval-input-key: user_prompt
+eval-reward-key: accuracy
+eval-max-response-len: 1024
+eval-temperature: 0.7
+eval-top-p: 0.95
+
+tensor-model-parallel-size: 1
+pipeline-model-parallel-size: 1
+context-parallel-size: 1
+expert-model-parallel-size: 1
+expert-tensor-parallel-size: 1
+recompute-granularity: full
+recompute-method: uniform
+recompute-num-layers: 1
+optimizer-cpu-offload: true
+overlap-cpu-optimizer-d2h-h2d: true
+use-precision-aware-optimizer: true
+use-dynamic-batch-size: true
+max-tokens-per-gpu: 2048
+
+advantage-estimator: grpo
+entropy-coef: 0.0
+eps-clip: 0.2
+eps-clip-high: 0.28
+use-tis: true
+optimizer: adam
+lr: 2.0e-6
+lr-decay-style: constant
+weight-decay: 0.01
+adam-beta1: 0.9
+adam-beta2: 0.98
+
+rollout-num-gpus-per-engine: 1
+sglang-mem-fraction-static: 0.15
+sglang-server-concurrency: 64
+attention-dropout: 0.0
+hidden-dropout: 0.0
+accumulate-allreduce-grads-in-fp32: true
+attention-softmax-in-fp32: true
+attention-backend: flash
+
+use-wandb: true
+wandb-always-use-train-step: true
+disable-wandb-random-suffix: true
+log-passrate: true
+log-eval-rollouts: true
+

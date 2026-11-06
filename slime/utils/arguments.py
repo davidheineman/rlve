@@ -1,3 +1,4 @@
+import argparse
 import os
 
 from transformers import AutoConfig
@@ -74,6 +75,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This will always be true when --colocate is set."
                 ),
             )
+            parser.add_argument("--opd-teacher-dir", type=str, default=None)
+            parser.add_argument("--opd-teacher-gpus", type=int, default=0)
+            parser.add_argument("--opd-teacher-cache-size", type=int, default=0,
+                                help="Maximum teachers resident per scorer GPU; zero keeps the full bank on GPU.")
+            parser.add_argument("--opd-student-eos-token-id", type=int, default=None,
+                                help="Canonical student stop token for optional teacher EOS-label transport.")
+            parser.add_argument("--opd-teacher-eos-token-id", type=int, default=None,
+                                help="Teacher stop token to swap with the student's stop token when scoring OPD.")
+            parser.add_argument("--opd-replay-fraction", type=float, default=0.0,
+                                help="Fraction of student batch trajectories replaced by cached OPD traces.")
+            parser.add_argument("--opd-replay-capacity-per-env", type=int, default=400)
+            parser.add_argument("--opd-replay-clip-epsilon", type=float, default=0.2)
+            parser.add_argument("--opd-replay-load", type=str, default=None,
+                                help="Committed replay snapshot paired with the parent student checkpoint.")
+            parser.add_argument("--early-stop-val-accuracy", type=float, default=None)
+            parser.add_argument(
+                "--early-stop-eval-names", nargs="+", default=["val_envs"],
+                help="Eval dataset names whose combined exact-match accuracy controls early stopping.",
+            )
+            parser.add_argument("--eval-on-last-rollout", action="store_true")
+            parser.add_argument("--early-stop-patience-evals", type=int, default=None)
+            parser.add_argument("--early-stop-min-rollouts", type=int, default=0)
+            parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
+            parser.add_argument("--require-early-stop", action="store_true")
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
@@ -159,6 +184,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--answer-forcing",
+                action="store_true",
+                help="After a response hits its generation cap, append a final-answer prefix and sample a short continuation (also during eval).",
+            )
+            parser.add_argument(
+                "--answer-forcing-extra-tokens",
+                type=int,
+                default=128,
+                help="Maximum sampled tokens after the forced final-answer prefix.",
+            )
+            parser.add_argument(
                 "--rollout-skip-special-tokens",
                 action="store_true",
                 default=False,
@@ -229,6 +265,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--dynamic-sampling-max-rejections",
+                type=int,
+                default=None,
+                help="Accept unfiltered groups after this many rejected groups per rollout, avoiding an endless DAPO search.",
+            )
 
             # partial rollout
             parser.add_argument(
@@ -276,6 +318,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Interval for updating the weights",
+            )
+            parser.add_argument(
+                "--fixed-rollout-policy",
+                action="store_true",
+                help="Generate training rollouts with the unchanged initial policy while evaluating the student.",
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -339,6 +386,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [\{'role': 'user', 'content': 'blabla'\}]. "
                 ),
             )
+            parser.add_argument(
+                "--program-tree-sampler-spec", type=str, default=None,
+                help="JSON specification for fresh program-tree prompts sampled at each rollout step.",
+            )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
@@ -388,6 +439,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Number of steps per rollout, e.g. It is equivalent to setting gbs as "
                     "`rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout`."
                 ),
+            )
+            parser.add_argument(
+                "--train-reuse-epochs",
+                type=int,
+                default=1,
+                help="Replay each scored rollout batch for this many full optimizer passes.",
+            )
+            parser.add_argument(
+                "--rollout-anneal-thresholds", type=float, nargs="+", default=None,
+                help="Validation accuracies at which to decrease rollouts per prompt.",
+            )
+            parser.add_argument(
+                "--rollout-anneal-sizes", type=int, nargs="+", default=None,
+                help="Rollouts per prompt to use at each validation accuracy threshold.",
             )
             # mbs for the training, will be ignored if `use_dynamic_batch_size` is set.
             reset_arg(parser, "--micro-batch-size", type=int, default=1)
@@ -475,6 +540,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-top-k", type=int, default=None)
             parser.add_argument("--eval-max-response-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
+            parser.add_argument(
+                "--log-eval-rollouts",
+                action=argparse.BooleanOptionalAction,
+                help="Log all responses for the first fixed prompt per RLVE evaluation environment to W&B Tables.",
+            )
 
             return parser
 
@@ -494,6 +564,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
+            parser.add_argument("--transactional-checkpoints", action="store_true")
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -515,7 +586,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft_loss", "dpo_loss", "custom_loss"],
                 default="policy_loss",
                 help=(
                     "Choose loss type, currently support ppo policy_loss or sft_loss, "
@@ -531,6 +602,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "we will use this function to calculate the loss. "
                 ),
             )
+            parser.add_argument("--dpo-beta", type=float, default=0.1)
+            parser.add_argument("--dpo-online", action="store_true", default=False)
+            parser.add_argument("--dpo-base-hf", type=str, default=None)
             parser.add_argument(
                 "--kl-loss-type",
                 type=str,
@@ -629,6 +703,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
+            parser.add_argument(
+                "--wandb-run-name",
+                type=str,
+                default=None,
+                help="Name of the wandb run. Defaults to --wandb-group; set it when several runs share a group.",
+            )
             reset_arg(parser, "--wandb-project", type=str, default=None)
             parser.add_argument(
                 "--disable-wandb-random-suffix",
@@ -675,6 +755,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save the rollout data to this path for debugging. "
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
+            )
+            parser.add_argument(
+                "--save-rollouts-jsonl",
+                type=str,
+                default=None,
+                help="Write one HF-friendly JSONL file per training rollout; path may contain {rollout_id}.",
             )
             parser.add_argument(
                 "--load-debug-rollout-data",
@@ -860,6 +946,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Accessible as args.environment_list; type is list of str if provided, else None."
                 ),
             )
+            parser.add_argument("--rlve-prompt-pool", type=str, default=None)
+            parser.add_argument("--rlve-balanced-difficulty", action="store_true",
+                                help="Cycle through every environment/difficulty pair once before repeating")
+            parser.add_argument("--rlve-mix-file", type=str, default=None)
+            parser.add_argument("--rlve-mix-index", type=int, default=None)
+            parser.add_argument("--rlve-mix-seed", type=int, default=20260927)
+            parser.add_argument("--rlve-final-ood-eval-path", type=str, default=None)
+            parser.add_argument("--rlve-final-ood-only", action="store_true")
             parser.add_argument(
                 "--initial-difficulty",
                 type = int,
@@ -894,7 +988,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--custom-prompt-preprocessor",
                 type = str,
                 required = True,
-                choices = ("TinyZero", "ChatTemplate_NoSystemPrompt", ),
+                choices = ("TinyZero", "ChatTemplate_NoSystemPrompt", "ChatTemplate_BoxedAnswer", ),
                 help = "Choose a custom prompt preprocessor.",
             )
             return parser
@@ -998,6 +1092,72 @@ def parse_args(add_custom_arguments=None):
             args.eval_prompt_data = ["aime", args.eval_prompt_data[0]]
         assert len(args.eval_prompt_data) % 2 == 0, "eval prompt data will need to be in pairs"
 
+    if args.opd_teacher_dir is not None:
+        assert args.opd_teacher_cache_size >= 0
+        assert os.path.isdir(args.opd_teacher_dir), f"Missing OPD teacher directory: {args.opd_teacher_dir}"
+        assert args.opd_teacher_gpus > 0 and args.colocate and args.actor_num_nodes == 1
+        assert args.loss_type == "custom_loss" and not args.compute_advantages_and_returns
+        assert args.rollout_temperature == 1.0, "OPD log probabilities require sampling temperature 1"
+    else:
+        assert args.opd_teacher_gpus == 0, "OPD teacher GPUs require --opd-teacher-dir"
+
+    eos_pair = (getattr(args, "opd_student_eos_token_id", None), getattr(args, "opd_teacher_eos_token_id", None))
+    if any(value is not None for value in eos_pair):
+        if (any(value is None or value < 0 for value in eos_pair) or args.opd_teacher_dir is None):
+            raise ValueError("OPD EOS alignment requires a teacher bank and both nonnegative stop-token IDs")
+        if not set(eos_pair).issubset(set(args.rollout_stop_token_ids or [])):
+            raise ValueError("OPD EOS alignment requires --rollout-stop-token-ids to include both EOS aliases")
+        if args.opd_replay_fraction:
+            raise ValueError("OPD EOS alignment currently supports fresh trajectories only; cached scores may use old labels")
+
+    if not 0 <= args.opd_replay_fraction <= 0.5:
+        raise ValueError("OPD replay fraction must be in [0, 0.5]")
+    if args.opd_replay_capacity_per_env < 1 or not 0 < args.opd_replay_clip_epsilon < 1:
+        raise ValueError("OPD replay requires a positive capacity and clipping epsilon in (0, 1)")
+    if args.opd_replay_fraction:
+        if (args.opd_teacher_dir is None or args.n_samples_per_prompt != 1
+                or len(args.environment_list) != 1 or args.rollout_batch_size < 2
+                or args.custom_loss_function_path != "slime.backends.megatron_utils.opd_loss.opd_loss_function"):
+            raise ValueError("OPD replay requires single-environment student merges with the OPD loss and batch >=2")
+        if args.opd_replay_load and not os.path.isfile(args.opd_replay_load):
+            raise ValueError(f"Missing committed OPD replay snapshot: {args.opd_replay_load}")
+
+    if args.fixed_rollout_policy:
+        if backend != "megatron" or not args.colocate:
+            raise ValueError("Fixed rollout policy requires the colocated Megatron backend")
+        if args.keep_old_actor or args.debug_rollout_only or args.debug_train_only:
+            raise ValueError("Fixed rollout policy is incompatible with old-actor and debug modes")
+        if args.loss_type == "dpo_loss" or args.advantage_estimator != "grpo":
+            raise ValueError("Fixed rollout policy currently requires the GRPO objective")
+        if not args.use_tis:
+            raise ValueError("Fixed rollout policy requires --use-tis for off-policy correction")
+
+    if args.loss_type == "dpo_loss":
+        assert args.dpo_beta > 0 and not args.compute_advantages_and_returns
+        assert args.n_samples_per_prompt == 2 and args.micro_batch_size == 2
+        assert not args.use_dynamic_batch_size and args.balance_data
+        assert args.rollout_temperature == 1.0
+        if args.dpo_online:
+            assert args.dpo_base_hf and os.path.isdir(args.dpo_base_hf)
+            assert args.load_debug_rollout_data is None
+    else:
+        assert not args.dpo_online, "Online DPO requires the DPO loss"
+
+    if args.early_stop_val_accuracy is not None:
+        assert 0 < args.early_stop_val_accuracy <= 1
+        assert args.eval_interval is not None and (args.rlve or args.rollout_global_dataset)
+        assert args.save is None or args.transactional_checkpoints or os.environ.get("RLVE_FINAL_WEIGHTS_ONLY") == "1"
+        eval_names = set(args.eval_prompt_data[::2])
+        assert all(name.split("/", 1)[0] in eval_names for name in args.early_stop_eval_names)
+    if args.early_stop_patience_evals is not None:
+        assert args.early_stop_patience_evals > 0
+        assert args.early_stop_min_rollouts >= 0
+        assert 0 <= args.early_stop_min_delta < 1
+        assert args.eval_interval is not None and args.save is not None
+        assert args.transactional_checkpoints and args.rlve
+    if args.require_early_stop:
+        assert args.early_stop_patience_evals is not None or args.early_stop_val_accuracy is not None
+
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
@@ -1014,6 +1174,8 @@ def parse_args(add_custom_arguments=None):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
+    assert args.answer_forcing_extra_tokens > 0, "answer_forcing_extra_tokens must be positive"
+
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
@@ -1027,9 +1189,11 @@ def parse_args(add_custom_arguments=None):
     if args.load_debug_rollout_data is not None:
         print(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
-            "will not instantiate sglang servers and will only run the rollout generation."
+            "loading replay batches."
         )
-        args.debug_train_only = True
+        # DPO replays offline pairs but still evaluates the changing student.
+        if args.loss_type != "dpo_loss":
+            args.debug_train_only = True
 
     if args.debug_rollout_only:
         if args.colocate and args.rollout_num_gpus is None:
@@ -1071,6 +1235,19 @@ def parse_args(add_custom_arguments=None):
         f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
         f"is not a multiple of global_batch_size {args.global_batch_size}"
     )
+    assert args.train_reuse_epochs >= 1, "train_reuse_epochs must be positive"
+    if args.rollout_anneal_thresholds is not None or args.rollout_anneal_sizes is not None:
+        assert args.rollout_anneal_thresholds and args.rollout_anneal_sizes
+        assert len(args.rollout_anneal_thresholds) == len(args.rollout_anneal_sizes)
+        assert all(0 <= x <= 1 for x in args.rollout_anneal_thresholds)
+        assert args.rollout_anneal_thresholds == sorted(set(args.rollout_anneal_thresholds))
+        assert all(0 < x < args.n_samples_per_prompt for x in args.rollout_anneal_sizes)
+        assert args.rollout_anneal_sizes == sorted(args.rollout_anneal_sizes, reverse=True)
+        assert args.num_steps_per_rollout == 1 and args.train_reuse_epochs == 1
+        assert args.eval_interval is not None
+    if args.dynamic_sampling_max_rejections is not None:
+        assert args.dynamic_sampling_filter_path is not None
+        assert args.dynamic_sampling_max_rejections >= 0
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
@@ -1109,6 +1286,40 @@ def parse_args(add_custom_arguments=None):
                 "please use alltoall dispatcher instead."
             )
             args.moe_token_dispatcher_type = "alltoall"
+
+    if any(value is not None for value in (args.rlve_prompt_pool, args.rlve_mix_file, args.rlve_mix_index)):
+        if not args.rlve or not all(value is not None for value in (args.rlve_prompt_pool, args.rlve_mix_file, args.rlve_mix_index)):
+            raise ValueError("frozen mixing requires --rlve, --rlve-prompt-pool, --rlve-mix-file, and --rlve-mix-index")
+        if args.initial_difficulty != 0 or args.min_metric_to_increase_difficulty <= 1:
+            raise ValueError("frozen mixing requires difficulty fixed at zero")
+        from slime.utils.rlve_mixing import load_candidate
+
+        manifest, candidate = load_candidate(
+            args.rlve_mix_file, args.rlve_mix_index, args.environment_list, args.rlve_prompt_pool
+        )
+        args.rlve_mix_weights = candidate["weights"]
+        args.rlve_mix_alpha = candidate["alpha"]
+        args.rlve_pool_sha256 = manifest["pool_sha256"]
+
+    if args.rlve_balanced_difficulty:
+        if (not args.rlve or not args.environment_list or args.rlve_prompt_pool is not None or
+                args.initial_difficulty < 0 or
+                args.difficulty_sliding_window_size < args.initial_difficulty + 1 or
+                args.min_metric_to_increase_difficulty <= 1):
+            raise ValueError("balanced difficulty requires native RLVE sampling, fixed levels 0..initial_difficulty, and a full difficulty window")
+
+    if args.rlve_final_ood_only and args.rlve_final_ood_eval_path is None:
+        raise ValueError("final-only OOD evaluation requires --rlve-final-ood-eval-path")
+    if args.rlve_final_ood_eval_path is not None:
+        from pathlib import Path
+
+        if not args.rlve or args.eval_interval is None or args.num_rollout < 21:
+            raise ValueError("final OOD eval requires RLVE and at least 21 training updates")
+        if not Path(args.rlve_final_ood_eval_path).is_file():
+            raise ValueError(f"missing final OOD eval: {args.rlve_final_ood_eval_path}")
+        pairs = list(zip(args.eval_prompt_data[::2], args.eval_prompt_data[1::2]))
+        if not any(name == "test_envs" for name, _ in pairs):
+            raise ValueError("final OOD eval requires a test_envs evaluation dataset")
 
     sglang_validate_args(args)
 

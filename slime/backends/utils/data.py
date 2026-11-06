@@ -48,6 +48,24 @@ class DataIterator:
         return self
 
 
+def repeat_training_rollout(rollout_data, epochs):
+    """Replay the scored batch for full extra optimizer passes.
+
+    Keep raw_reward at its original length for per-prompt pass-rate logging.
+    This runs after old-policy log probabilities and advantages have been
+    computed, so every pass uses the same rollout policy and rewards.
+    """
+    if epochs < 1:
+        raise ValueError("epochs must be positive")
+    if epochs == 1:
+        return rollout_data
+    original_count = len(rollout_data["tokens"])
+    for key, value in list(rollout_data.items()):
+        if key != "raw_reward" and isinstance(value, list) and len(value) == original_count:
+            rollout_data[key] = value * epochs
+    return rollout_data
+
+
 def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu, cp_size):
     # use first fit to get the number of micro batches
     max_tokens_per_gpu *= cp_size
@@ -214,6 +232,8 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         "round_number",
         "sample_indices",
         "rollout_log_probs",
+        "teacher_log_probs",
+        "opd_replay_mask",
     ]:
         if key not in data:
             continue

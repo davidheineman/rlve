@@ -25,7 +25,12 @@ class TrainRayActor(RayActor):
         if master_addr:
             self.master_addr, self.master_port = master_addr, master_port
         else:
-            self.master_addr, self.master_port = self._get_current_node_ip_and_free_port(start_port=20000)
+            # SLIME_PORT_BASE (see slime/ray/rollout.py) keeps concurrent runs on one node
+            # from racing for the same torch.distributed port.
+            port_base = os.environ.get("SLIME_PORT_BASE")
+            self.master_addr, self.master_port = self._get_current_node_ip_and_free_port(
+                start_port=int(port_base) + 500 if port_base else 20000
+            )
 
         os.environ["MASTER_ADDR"] = self.master_addr
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -74,6 +79,11 @@ class TrainRayActor(RayActor):
             print(f"Warning: pynvml not available, skipping NUMA affinity setup")
         except Exception as e:
             print(f"Warning: Failed to set NUMA affinity: {e}")
+
+    def set_rollouts_per_prompt(self, count):
+        assert count > 0
+        self.args.n_samples_per_prompt = count
+        self.args.global_batch_size = self.args.rollout_batch_size * count
 
     @abc.abstractmethod
     def sleep(self, tags):

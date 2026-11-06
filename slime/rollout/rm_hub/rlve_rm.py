@@ -7,7 +7,7 @@ from typing import Dict, Any
 def rlve_rm(args, environment : str, config : Dict, response : str) -> Dict[str, Any] :
     if args.answer_marker_type == r"\boxed{}" :
         answer_markers = (r"\boxed{", r"}")
-        assert args.custom_prompt_preprocessor in ("ChatTemplate_NoSystemPrompt", )
+        assert args.custom_prompt_preprocessor in ("ChatTemplate_NoSystemPrompt", "ChatTemplate_BoxedAnswer", )
     elif args.answer_marker_type == r"<answer></answer>" :
         answer_markers = (r"<answer>", r"</answer>")
         assert args.custom_prompt_preprocessor in ("TinyZero", )

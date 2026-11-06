@@ -1,3 +1,4 @@
+import os
 import socket
 import ray
 from ray.util.placement_group import placement_group
@@ -13,7 +14,7 @@ class InfoActor:
         return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
 
 
-def sort_key(x):
+def sort_key(x, visible_devices=None):
     index, node_identifier, gpu_id = x
     # Sort by node IP number and then by GPU ID
     try:
@@ -31,10 +32,12 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
+    if visible_devices is not None and str(gpu_id) in visible_devices:
+        return (node_ip_parts, visible_devices.index(str(gpu_id)))
     return (node_ip_parts, gpu_id)
 
 
-def _create_placement_group(num_gpus):
+def _create_placement_group(num_gpus, visible_devices=None):
     """Create a placement group with the specified number of GPUs."""
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
@@ -56,8 +59,14 @@ def _create_placement_group(num_gpus):
     for actor in info_actors:
         ray.kill(actor)
 
+    if visible_devices is not None and set(str(gpu_id) for _, gpu_id in gpu_ids) != set(visible_devices):
+        raise RuntimeError("Ray GPU assignments differ from CUDA_VISIBLE_DEVICES")
+
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    pg_reordered_bundle_indices = [bundle_info[0] for bundle_info in sorted(bundle_infos, key=sort_key)]
+    pg_reordered_bundle_indices = [
+        bundle_info[0]
+        for bundle_info in sorted(bundle_infos, key=lambda value: sort_key(value, visible_devices))
+    ]
     for i in range(num_bundles):
         actual_bundle_index = pg_reordered_bundle_indices[i]
         print(
@@ -85,14 +94,23 @@ def create_placement_groups(args):
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
         rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
 
-    print(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus)
+    teacher_gpus = getattr(args, "opd_teacher_gpus", 0) + int(getattr(args, "dpo_online", False))
+    student_gpus = num_gpus
+    num_gpus += teacher_gpus
+    visible_devices = None
+    if teacher_gpus:
+        visible_devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        assert len(visible_devices) == num_gpus
 
-    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
+    print(f"Creating placement group with {num_gpus} GPUs...")
+    pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus, visible_devices)
+
+    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:student_gpus]
 
     return {
         "actor": (pg, actor_pg_reordered_bundle_indices),
         "rollout": (pg, rollout_pg_reordered_bundle_indices),
+        "teacher": (pg, actor_pg_reordered_bundle_indices[student_gpus:]),
     }
 
 

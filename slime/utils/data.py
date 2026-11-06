@@ -92,15 +92,23 @@ TinyZero_TEMPLATE = """A conversation between User and Assistant. The user asks 
 User: {prompt}
 Assistant: Let me solve this step by step.
 <think>"""
+# RLVE environment prompts never say how to mark the final answer; the verifier just looks
+# for the answer markers. Reasoning models (R1-Distill, ProRL, OpenThinker) emit \boxed{}
+# on their own, but a plain instruct model answers "21" and scores -1 on every sample, which
+# leaves GRPO with no reward variance at all. This suffix asks for the marker explicitly.
+BOXED_ANSWER_SUFFIX = "\n\nThink step by step, then give your final answer inside \\boxed{}."
 def custom_prompt_preprocessor(args, user_prompt : str, apply_chat_template : bool) -> Union[str, List[Dict[str, str]]] :
     if args.custom_prompt_preprocessor == "TinyZero" :
         assert not apply_chat_template
         return TinyZero_TEMPLATE.format(prompt = user_prompt)
-    elif args.custom_prompt_preprocessor == "ChatTemplate_NoSystemPrompt" :
+    elif args.custom_prompt_preprocessor in ("ChatTemplate_NoSystemPrompt", "ChatTemplate_BoxedAnswer") :
         assert apply_chat_template
         # Check if user_prompt is already in chat format (list of dicts)
         if isinstance(user_prompt, list) and len(user_prompt) > 0 and isinstance(user_prompt[0], dict) and "role" in user_prompt[0]:
             return user_prompt
+        if args.custom_prompt_preprocessor == "ChatTemplate_BoxedAnswer" :
+            assert args.answer_marker_type == r"\boxed{}", "ChatTemplate_BoxedAnswer only makes sense with --answer-marker-type '\boxed{}'"
+            user_prompt = user_prompt + BOXED_ANSWER_SUFFIX
         return [{"role" : "user", "content": user_prompt}]
     else :
         raise NotImplementedError(f"User prompt processor {args.custom_prompt_preprocessor} not implemented.")

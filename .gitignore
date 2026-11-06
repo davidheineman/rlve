@@ -193,3 +193,10 @@ local/
 glm/
 _examples_synced/
 .env
+plot/
+data/*
+.runs/
+# *.slurm
+# *.sbatch
+# *.sh
+slurm/

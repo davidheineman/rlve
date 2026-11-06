@@ -323,19 +323,22 @@ class UpdateWeightFromTensor:
                 self._ipc_engine = engine
 
     @torch.no_grad()
-    def update_weights(self):
+    def update_weights(self, model_tag="actor"):
         self.weight_version += 1
+
+        if model_tag not in self.weights:
+            raise ValueError(f"No weights available for model tag {model_tag!r}")
 
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
         for param_infos in tqdm(self.param_info_buckets, disable=rank != 0, desc="Update weights"):
-            self._update_bucket_weights_from_tensor(param_infos)
+            self._update_bucket_weights_from_tensor(param_infos, model_tag)
 
         dist.barrier(group=get_gloo_group())
 
-    def _update_bucket_weights_from_tensor(self, param_infos):
+    def _update_bucket_weights_from_tensor(self, param_infos, model_tag):
         monkey_patch_torch_reductions()
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         ep_size = mpu.get_expert_model_parallel_world_size()
@@ -346,7 +349,7 @@ class UpdateWeightFromTensor:
             if dist.get_rank() == info.src_rank:
                 params.append(
                     torch.nn.Parameter(
-                        self.weights["actor"][info.name].to(device=torch.cuda.current_device(), non_blocking=True),
+                        self.weights[model_tag][info.name].to(device=torch.cuda.current_device(), non_blocking=True),
                         requires_grad=False,
                     )
                 )
@@ -488,7 +491,9 @@ class UpdateWeightFromDistributed:
             ray.get(refs)
 
     @torch.no_grad()
-    def update_weights(self):
+    def update_weights(self, model_tag="actor"):
+        if model_tag != "actor":
+            raise ValueError("Only colocated weight updates support alternate model tags")
         self.weight_version += 1
 
         if dist.get_rank() == 0:

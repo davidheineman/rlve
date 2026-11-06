@@ -83,6 +83,11 @@ def gather_log_data(metic_name, args, rollout_id, log_dict):
                 if not args.wandb_always_use_train_step
                 else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
             )
+            if metic_name == "rollout":
+                for key in ("truncated", "response_lengths"):
+                    if f"rollout/{key}" in reduced_log_dict:
+                        reduced_log_dict[f"david/rollout/{key}"] = reduced_log_dict[f"rollout/{key}"]
+                reduced_log_dict["david/step"] = reduced_log_dict["rollout/step"]
             wandb.log(reduced_log_dict)
         return reduced_log_dict
     else:
@@ -114,7 +119,7 @@ def log_rollout_data(rollout_id, args, rollout_data):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     val = torch.cat(val).clone().detach()
-                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages"]:
+                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "teacher_log_probs", "returns", "advantages"]:
                         sum_of_sample_mean = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
